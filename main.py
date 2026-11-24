@@ -1,10 +1,7 @@
-#!/usr/bin/env python3
-"""The Funniest Out-of-Office.
+"""Out-of-office auto-reply entry.
 
-Writes a single original line of an out-of-office auto-reply — the
-funniest one line it can be — to entry.txt in the output directory.
-
-Pure Python standard library only; no third-party packages.
+Writes a single funny out-of-office line to entry.txt in the output
+directory, with no trailing newline, using only the standard library.
 """
 
 import os
@@ -12,92 +9,75 @@ import stat
 import sys
 import tempfile
 
-# The line: the auto-reply itself is the joke's subject. The reader is
-# literally reading the thing being praised — the one member of staff
-# still on the job is the message telling you nobody is, and the kicker
-# is that it is not even on payroll.
-LINE = (
-    "I'm out of the office until Monday. This auto-reply is the "
-    "hardest-working member of staff, and it isn't even on payroll."
-)
+LINE = "I'm out of office \u2014 my inbox went on vacation too, and it's ignoring you even better than I ever could. Back Monday, probably."
 
 OUTPUT_FILENAME = "entry.txt"
 MAX_CHARS = 140
 
 
-def validate(line: str) -> None:
-    """Check the line meets the competition gate.
-
-    Order matters: the whitespace-only case is reported on its own
-    before the leading/trailing-whitespace check, so the message
-    always describes the actual problem.
-    """
+def validate(line):
+    """Check the entry line meets the bounty gate before writing it."""
     if not isinstance(line, str):
-        raise ValueError("line must be a string")
-    if not line.strip():
-        raise ValueError("line must not be only whitespace")
-    if not any(ch.isalpha() for ch in line):
-        raise ValueError("line must contain at least one letter")
-    if not (1 <= len(line) <= MAX_CHARS):
-        raise ValueError(
-            f"line must be 1-{MAX_CHARS} characters, got {len(line)}"
-        )
-    if line != line.strip():
-        raise ValueError("line must not have leading or trailing whitespace")
+        raise ValueError("entry line must be a string")
+    if not 1 <= len(line) <= MAX_CHARS:
+        raise ValueError("entry line must be 1 to 140 characters, got %d" % len(line))
     if "\n" in line or "\r" in line:
-        raise ValueError("line must be a single line")
-    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in line):
-        raise ValueError("line must not contain control characters")
+        raise ValueError("entry line must be a single line")
+    if line != line.strip():
+        raise ValueError("entry line must not have leading or trailing whitespace")
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in line):
+        raise ValueError("entry line must not contain control characters")
+    if not any(ch.isalpha() for ch in line):
+        raise ValueError("entry line must contain at least one letter")
 
 
-def main() -> int:
-    validate(LINE)
-
-    output_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
+def write_entry(line, output_dir):
+    """Write the line atomically and verify what landed on disk."""
+    validate(line)
     os.makedirs(output_dir, exist_ok=True)
+
+    data = line.encode("utf-8")
     target = os.path.join(output_dir, OUTPUT_FILENAME)
+    if os.path.isdir(target):
+        raise RuntimeError("output path %s is a directory" % target)
 
-    data = LINE.encode("utf-8")
-
-    # Defense in depth: the encoded bytes themselves must hold no
-    # newline or carriage return, so the file can never gain a second
-    # line even if validate() were ever bypassed.
-    if b"\n" in data or b"\r" in data:
-        raise ValueError("line must be a single line")
-
-    # Write via a temp file in the same directory, then atomically rename
-    # so a reader never sees a half-written entry. chmod on the temp
-    # file before the rename (a fresh tempfile is 0600 by default) and
-    # again on the final path, so the graded file is world-readable.
-    fd, tmp_path = tempfile.mkstemp(
-        dir=output_dir, prefix=".entry-", suffix=".tmp"
-    )
+    fd, tmp_path = tempfile.mkstemp(prefix=".entry-", dir=output_dir)
     try:
-        with os.fdopen(fd, "wb") as fh:
-            fh.write(data)
-        os.chmod(tmp_path, 0o644)
+        os.fchmod(fd, 0o644)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
         os.replace(tmp_path, target)
-        os.chmod(target, 0o644)
     except BaseException:
         try:
             os.unlink(tmp_path)
         except OSError:
             pass
         raise
+    os.chmod(target, 0o644)
 
-    # Read back and verify byte-for-byte, UTF-8, no trailing newline.
-    with open(target, "rb") as fh:
-        written = fh.read()
+    with open(target, "rb") as handle:
+        written = handle.read()
     if written != data:
-        raise RuntimeError("read-back bytes differ from intended bytes")
-    text = written.decode("utf-8")
-    if text.endswith("\n"):
-        raise RuntimeError("entry must not end with a newline")
+        raise RuntimeError("verification failed: bytes on disk differ from the entry line")
+    if written.decode("utf-8") != line:
+        raise RuntimeError("verification failed: file does not decode to the entry line")
+    if written.endswith(b"\n"):
+        raise RuntimeError("verification failed: file has a trailing newline")
     mode = stat.S_IMODE(os.stat(target).st_mode)
     if mode != 0o644:
-        raise RuntimeError(f"entry mode is {oct(mode)}, expected 0o644")
+        raise RuntimeError("verification failed: mode is %o, expected 644" % mode)
 
-    print(f"Wrote {len(text)} chars, {len(data)} bytes to {target}")
+    return len(line), len(data)
+
+
+def main():
+    output_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
+    try:
+        chars, nbytes = write_entry(LINE, output_dir)
+    except (ValueError, OSError, RuntimeError) as exc:
+        print("error: %s" % exc, file=sys.stderr)
+        return 1
+    print("wrote %d characters (%d bytes) to entry.txt" % (chars, nbytes))
     return 0
 
 
